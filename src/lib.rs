@@ -4,6 +4,7 @@ extern crate libc;
 #[cfg(feature = "tokio")]
 extern crate tokio;
 
+use std::future::Future;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net;
 use std::{alloc, io, mem, ptr};
@@ -24,6 +25,22 @@ pub trait RecvWithFd {
     ///
     /// The bytes and the file descriptors are received into the corresponding buffers.
     fn recv_with_fd(&self, bytes: &mut [u8], fds: &mut [RawFd]) -> io::Result<(usize, usize)>;
+}
+
+pub trait AsyncSendWithFd {
+    /// Send the bytes and the file descriptors.
+    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> impl Future<Output = io::Result<usize>>;
+}
+
+pub trait AsyncRecvWithFd {
+    /// Receive the bytes and the file descriptors.
+    ///
+    /// The bytes and the file descriptors are received into the corresponding buffers.
+    fn recv_with_fd(
+        &self,
+        bytes: &mut [u8],
+        fds: &mut [RawFd],
+    ) -> impl Future<Output = io::Result<(usize, usize)>>;
 }
 
 // Replace with `<*const u8>::offset_from` once it is stable.
@@ -185,24 +202,26 @@ impl SendWithFd for net::UnixStream {
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl SendWithFd for tokio::net::UnixStream {
+impl AsyncSendWithFd for tokio::net::UnixStream {
     /// Send the bytes and the file descriptors as a stream.
     ///
     /// Neither is guaranteed to be received by the other end in a single chunk and
     /// may arrive entirely independently.
-    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
-        self.try_io(Interest::WRITABLE, || send_with_fd(self.as_raw_fd(), bytes, fds))
+    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> impl Future<Output = io::Result<usize>> {
+        self.async_io(Interest::WRITABLE, move || {
+            send_with_fd(self.as_raw_fd(), bytes, fds)
+        })
     }
 }
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl SendWithFd for tokio::net::unix::WriteHalf<'_> {
+impl AsyncSendWithFd for tokio::net::unix::WriteHalf<'_> {
     /// Send the bytes and the file descriptors as a stream.
     ///
     /// Neither is guaranteed to be received by the other end in a single chunk and
     /// may arrive entirely independently.
-    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> impl Future<Output = io::Result<usize>> {
         let unix_stream: &tokio::net::UnixStream = self.as_ref();
         unix_stream.send_with_fd(bytes, fds)
     }
@@ -221,14 +240,16 @@ impl SendWithFd for net::UnixDatagram {
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl SendWithFd for tokio::net::UnixDatagram {
+impl AsyncSendWithFd for tokio::net::UnixDatagram {
     /// Send the bytes and the file descriptors as a single packet.
     ///
     /// It is guaranteed that the bytes and the associated file descriptors will arrive at the same
     /// time, however the receiver end may not receive the full message if its buffers are too
     /// small.
-    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
-        self.try_io(Interest::WRITABLE, || send_with_fd(self.as_raw_fd(), bytes, fds))
+    fn send_with_fd(&self, bytes: &[u8], fds: &[RawFd]) -> impl Future<Output = io::Result<usize>> {
+        self.async_io(Interest::WRITABLE, move || {
+            send_with_fd(self.as_raw_fd(), bytes, fds)
+        })
     }
 }
 
@@ -245,26 +266,36 @@ impl RecvWithFd for net::UnixStream {
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl RecvWithFd for tokio::net::UnixStream {
+impl AsyncRecvWithFd for tokio::net::UnixStream {
     /// Receive the bytes and the file descriptors from the stream.
     ///
     /// It is not guaranteed that the received information will form a single coherent packet of
     /// data. In other words, it is not required that this receives the bytes and file descriptors
     /// that were sent with a single `send_with_fd` call by somebody else.
-    fn recv_with_fd(&self, bytes: &mut [u8], fds: &mut [RawFd]) -> io::Result<(usize, usize)> {
-        self.try_io(Interest::READABLE, || recv_with_fd(self.as_raw_fd(), bytes, fds))
+    fn recv_with_fd(
+        &self,
+        bytes: &mut [u8],
+        fds: &mut [RawFd],
+    ) -> impl Future<Output = io::Result<(usize, usize)>> {
+        self.async_io(Interest::READABLE, move || {
+            recv_with_fd(self.as_raw_fd(), bytes, fds)
+        })
     }
 }
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl RecvWithFd for tokio::net::unix::ReadHalf<'_> {
+impl AsyncRecvWithFd for tokio::net::unix::ReadHalf<'_> {
     /// Receive the bytes and the file descriptors from the stream.
     ///
     /// It is not guaranteed that the received information will form a single coherent packet of
     /// data. In other words, it is not required that this receives the bytes and file descriptors
     /// that were sent with a single `send_with_fd` call by somebody else.
-    fn recv_with_fd(&self, bytes: &mut [u8], fds: &mut [RawFd]) -> io::Result<(usize, usize)> {
+    fn recv_with_fd(
+        &self,
+        bytes: &mut [u8],
+        fds: &mut [RawFd],
+    ) -> impl Future<Output = io::Result<(usize, usize)>> {
         let unix_stream: &tokio::net::UnixStream = self.as_ref();
         unix_stream.recv_with_fd(bytes, fds)
     }
@@ -288,7 +319,7 @@ impl RecvWithFd for net::UnixDatagram {
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(sendfd_docs, doc(cfg(feature = "tokio")))]
-impl RecvWithFd for tokio::net::UnixDatagram {
+impl AsyncRecvWithFd for tokio::net::UnixDatagram {
     /// Receive the bytes and the file descriptors as a single packet.
     ///
     /// It is guaranteed that the received information will form a single coherent packet, and data
@@ -299,8 +330,14 @@ impl RecvWithFd for tokio::net::UnixDatagram {
     /// For receiving the file descriptors, the internal buffer is sized according to the size of
     /// the `fds` buffer. If the sender sends `fds.len()` descriptors, but prefaces the descriptors
     /// with some other ancilliary data, then some file descriptors may be truncated as well.
-    fn recv_with_fd(&self, bytes: &mut [u8], fds: &mut [RawFd]) -> io::Result<(usize, usize)> {
-        self.try_io(Interest::READABLE, || recv_with_fd(self.as_raw_fd(), bytes, fds))
+    fn recv_with_fd(
+        &self,
+        bytes: &mut [u8],
+        fds: &mut [RawFd],
+    ) -> impl Future<Output = io::Result<(usize, usize)>> {
+        self.async_io(Interest::READABLE, move || {
+            recv_with_fd(self.as_raw_fd(), bytes, fds)
+        })
     }
 }
 
